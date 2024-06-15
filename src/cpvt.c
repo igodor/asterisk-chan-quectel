@@ -14,6 +14,7 @@
 #include "at_queue.h"     /* struct at_queue_task */
 #include "chan_quectel.h" /* struct pvt */
 #include "channel.h"
+#include "helpers.h"
 #include "mutils.h" /* ARRAY_LEN() */
 
 const char* call_state2str(call_state_t state)
@@ -126,12 +127,15 @@ void cpvt_free(struct cpvt* cpvt)
     ast_debug(3, "[%s] Destroy cpvt - idx:%d dir:%d state:%s flags:%d channel:%s\n", PVT_ID(pvt), cpvt->call_idx, CPVT_DIRECTION(cpvt),
               call_state2str(cpvt->state), cpvt->flags, cpvt->channel ? "attached" : "detached");
 
-    if (PVT_NO_CHANS(pvt)) {
-        pvt_on_remove_last_channel(pvt);
-        pvt_try_restate(pvt);
+    if (!CPVT_TEST_FLAG(cpvt, CALL_FLAG_DISCONNECTING)) {
+        if (PVT_NO_CHANS(pvt)) {
+            pvt_on_remove_last_channel(pvt);
+            pvt_try_restate(pvt);
+        }
+
+        decrease_chan_counters(cpvt, pvt);
     }
 
-    decrease_chan_counters(cpvt, pvt);
     relink_to_sys_chan(cpvt, pvt);
 
     ast_free(cpvt->buffer);
@@ -370,14 +374,14 @@ int cpvt_change_state(struct cpvt* const cpvt, call_state_t newstate, int cause)
     return 1;
 }
 
-void cpvt_lock(struct cpvt* const cpvt)
+int cpvt_lock(struct cpvt* const cpvt)
 {
     struct pvt* const pvt = cpvt->pvt;
     if (!pvt) {
-        return;
+        return -1;
     }
 
-    ast_mutex_trylock(&pvt->lock);
+    return AO2_REF_AND_LOCK(pvt);
 }
 
 void cpvt_try_lock(struct cpvt* const cpvt)
@@ -392,9 +396,9 @@ void cpvt_try_lock(struct cpvt* const cpvt)
         return;
     }
 
-    ast_mutex_t* const mutex = &pvt->lock;
+    ao2_ref(pvt, 1);
 
-    while (ast_mutex_trylock(mutex)) {
+    while (ao2_trylock(pvt)) {
         CHANNEL_DEADLOCK_AVOIDANCE(channel);
     }
 }

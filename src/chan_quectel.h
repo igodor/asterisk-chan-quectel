@@ -16,8 +16,8 @@
 
 #include "ast_config.h"
 
+#include <asterisk/astobj2.h>
 #include <asterisk/json.h>
-#include <asterisk/linkedlists.h>
 #include <asterisk/localtime.h>
 #include <asterisk/lock.h>
 #include <asterisk/strings.h>
@@ -91,9 +91,6 @@ typedef struct pvt_stat {
 struct at_queue_task;
 
 typedef struct pvt {
-    AST_LIST_ENTRY(pvt) entry; /*!< linked list pointers */
-
-    ast_mutex_t lock;                               /*!< pvt lock */
     AST_LIST_HEAD_NOLOCK(, at_queue_task) at_queue; /*!< queue for commands to modem */
 
     AST_LIST_HEAD_NOLOCK(, cpvt) chans; /*!< list of channels */
@@ -195,7 +192,7 @@ typedef struct pvt {
 #define PVT_STAT(pvt, name) PVT_STAT_T(&(pvt)->stat, name)
 
 typedef struct public_state {
-    AST_RWLIST_HEAD(devices, pvt) devices;
+    struct ao2_container* pvts;
     struct ast_threadpool* threadpool;
     pthread_t dev_manager_thread;
     int dev_manager_event;

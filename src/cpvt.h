@@ -47,7 +47,8 @@ typedef enum {
     CALL_FLAG_MULTIPARTY       = 256,  /*!< internal, CLCC mpty is 1 */
     CALL_FLAG_DIRECTION        = 512,  /*!< call direction */
     CALL_FLAG_LOCAL_CHANNEL    = 1024, /*!< local channel flag */
-    CALL_FLAG_INTERNAL_REQUEST = 2048  /*!< internal request */
+    CALL_FLAG_INTERNAL_REQUEST = 2048, /*!< internal request */
+    CALL_FLAG_DISCONNECTING    = 4096  /*!< object is disconnecting */
 } call_flag_t;
 
 #define CALL_DIR_INCOMING 1u
@@ -99,7 +100,7 @@ typedef struct cpvt {
 struct cpvt* cpvt_alloc(struct pvt* pvt, int call_idx, unsigned dir, call_state_t statem, unsigned local_channel);
 void cpvt_free(struct cpvt* cpvt);
 
-void cpvt_lock(struct cpvt* const);
+int cpvt_lock(struct cpvt* const);
 void cpvt_try_lock(struct cpvt* const);
 void cpvt_unlock(struct cpvt* const);
 

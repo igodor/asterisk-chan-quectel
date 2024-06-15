@@ -316,7 +316,7 @@ void at_queue_handle_result(struct pvt* pvt, at_res_t res) { at_queue_remove_cmd
 
 void at_queue_flush(struct pvt* pvt)
 {
-    while (AST_LIST_FIRST(&pvt->at_queue)) {
+    while (!AST_LIST_EMPTY(&pvt->at_queue)) {
         at_queue_remove(pvt);
     }
 }

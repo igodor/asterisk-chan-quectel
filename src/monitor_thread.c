@@ -178,7 +178,7 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
 
     RAII_VAR(struct ast_str* const, result, ast_str_create(RINGBUFFER_SIZE), ast_free);
 
-    ast_mutex_lock(&pvt->lock);
+    ao2_lock(pvt);
     RAII_VAR(char* const, dev, ast_strdup(PVT_ID(pvt)), ast_free);
 
     RAII_VAR(struct ast_taskprocessor*, tps, threadpool_serializer(gpublic->threadpool, dev), ast_taskprocessor_unreference);
@@ -197,7 +197,7 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
         goto e_cleanup;
     }
 
-    ast_mutex_unlock(&pvt->lock);
+    ao2_unlock(pvt);
 
     int read_result = 0;
     while (1) {
@@ -205,7 +205,7 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
             ast_debug(5, "[%s] Unable to handle exprired reports\n", dev);
         }
 
-        if (ast_mutex_trylock(&pvt->lock)) {  // pvt unlocked
+        if (ao2_trylock(pvt)) {  // pvt unlocked
             int t = RESPONSE_READ_TIMEOUT;
             if (!at_wait(fd, &t)) {
                 if (ast_taskprocessor_push(tps, at_enqueue_ping_taskproc, pvt)) {
@@ -229,7 +229,7 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
                 is_cmd_timeout = 0;
             }
 
-            ast_mutex_unlock(&pvt->lock);
+            ao2_unlock(pvt);
 
             if (is_cmd_timeout) {
                 if (t <= 0) {
@@ -276,9 +276,9 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
             break;
         }
 
-        if (!ast_mutex_trylock(&pvt->lock)) {
+        if (!ao2_trylock(pvt)) {
             PVT_STAT(pvt, d_read_bytes) += iovcnt;
-            ast_mutex_unlock(&pvt->lock);
+            ao2_unlock(pvt);
         }
 
         struct iovec iov[2];
@@ -303,7 +303,7 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
         }
     }
 
-    ast_mutex_lock(&pvt->lock);
+    ao2_unlock(pvt);
 
 e_cleanup:
     if (!pvt->initialized) {
@@ -315,21 +315,22 @@ e_cleanup:
 
 e_restart:
     pvt_disconnect(pvt);
-    //	pvt->monitor_running = 0;
-    ast_mutex_unlock(&pvt->lock);
+    ao2_unlock(pvt);
 }
 
 static void* monitor_threadproc(void* _pvt)
 {
     struct pvt* const pvt = _pvt;
     monitor_threadproc_pvt(pvt);
-    /* TODO: wakeup discovery thread after some delay */
+    ao2_ref(pvt, -1);
     return NULL;
 }
 
 int pvt_monitor_start(struct pvt* pvt)
 {
+    ao2_ref(pvt, 1);
     if (ast_pthread_create_background(&pvt->monitor_thread, NULL, monitor_threadproc, pvt) < 0) {
+        ao2_ref(pvt, -1);
         pvt->monitor_thread = AST_PTHREADT_NULL;
         return 0;
     }
@@ -348,7 +349,7 @@ void pvt_monitor_stop(struct pvt* pvt)
 
     {
         const pthread_t id = pvt->monitor_thread;
-        SCOPED_LOCK(pvt_lock, &pvt->lock, ast_mutex_unlock, ast_mutex_lock);  // scoped UNlock
+        SCOPED_LOCK(pvt_lock, pvt, ao2_unlock, ao2_lock);  // scoped UNlock
         pthread_join(id, NULL);
     }
 

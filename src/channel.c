@@ -240,7 +240,7 @@ static int channel_call(struct ast_channel* channel, const char* dest, attribute
         return -1;
     }
 
-    SCOPED_MUTEX(pvt_lock, &pvt->lock);
+    SCOPED_AO2LOCK(pvt_lock, pvt);
 
     // FIXME: check if bridged on same device with CALL_FLAG_HOLD_OTHER
     if (!pvt_ready4voice_call(pvt, cpvt, opts)) {
@@ -285,7 +285,7 @@ static int channel_hangup(struct ast_channel* channel)
     if (cpvt && cpvt->channel == channel && cpvt->pvt) {
         struct pvt* const pvt = cpvt->pvt;
 
-        SCOPED_MUTEX(pvt_lock, &pvt->lock);
+        SCOPED_AO2LOCK(pvt_lock, pvt);
 
         const int need_hangup  = CPVT_TEST_FLAG(cpvt, CALL_FLAG_NEED_HANGUP) ? 1 : 0;
         const int hangup_cause = ast_channel_hangupcause(channel);
@@ -308,10 +308,7 @@ static int channel_hangup(struct ast_channel* channel)
 
     /* drop channel -> cpvt reference */
     ast_channel_tech_pvt_set(channel, NULL);
-
-    ast_module_unref(self_module());
     ast_setstate(channel, AST_STATE_DOWN);
-
     return 0;
 }
 
@@ -327,7 +324,7 @@ static int channel_answer(struct ast_channel* channel)
     }
     struct pvt* const pvt = cpvt->pvt;
 
-    SCOPED_MUTEX(pvt_lock, &pvt->lock);
+    SCOPED_AO2LOCK(pvt_lock, pvt);
 
     if (CPVT_DIR_INCOMING(cpvt)) {
         if (at_enqueue_answer(cpvt)) {
@@ -350,7 +347,7 @@ static int channel_digit_begin(struct ast_channel* channel, char digit)
     }
     struct pvt* const pvt = cpvt->pvt;
 
-    SCOPED_MUTEX(pvt_lock, &pvt->lock);
+    SCOPED_AO2LOCK(pvt_lock, pvt);
 
     const int rv = at_enqueue_dtmf(cpvt, digit);
     if (rv) {
@@ -855,7 +852,7 @@ static int channel_fixup(struct ast_channel* oldchannel, struct ast_channel* new
 
     struct pvt* const pvt = cpvt->pvt;
 
-    SCOPED_MUTEX(pvt_lock, &pvt->lock);
+    SCOPED_AO2LOCK(pvt_lock, pvt);
 
     if (cpvt->channel == oldchannel) {
         cpvt->channel = newchannel;
@@ -931,7 +928,7 @@ static int channel_indicate(struct ast_channel* channel, int condition, const vo
             if (!pvt || CONF_SHARED(pvt, moh)) {
                 ast_moh_start(channel, data, NULL);
             } else {
-                SCOPED_MUTEX(pvt_lock, &pvt->lock);
+                SCOPED_AO2LOCK(pvt_lock, pvt);
                 at_enqueue_mute(cpvt, 1);
             }
             break;
@@ -940,14 +937,14 @@ static int channel_indicate(struct ast_channel* channel, int condition, const vo
             if (!pvt || CONF_SHARED(pvt, moh)) {
                 ast_moh_stop(channel);
             } else {
-                SCOPED_MUTEX(pvt_lock, &pvt->lock);
+                SCOPED_AO2LOCK(pvt_lock, pvt);
                 at_enqueue_mute(cpvt, 0);
             }
             break;
 
         case AST_CONTROL_CONNECTED_LINE: {
             struct ast_party_connected_line* const cnncd = ast_channel_connected(channel);
-            SCOPED_MUTEX(pvt_lock, &pvt->lock);
+            SCOPED_AO2LOCK(pvt_lock, pvt);
             ast_log(LOG_NOTICE, "[%s] Connected party is now %s <%s>\n", PVT_ID(pvt), S_COR(cnncd->id.name.valid, cnncd->id.name.str, ""),
                     S_COR(cnncd->id.number.valid, cnncd->id.number.str, ""));
             break;
@@ -991,6 +988,8 @@ struct ast_channel* channel_new(struct pvt* pvt, int ast_state, const char* cid_
     cpvt->channel = channel;
     pvt->channel_instance++;
 
+    ast_channel_stage_snapshot(channel);
+
     ast_channel_tech_pvt_set(channel, cpvt);
     ast_channel_tech_set(channel, &channel_tech);
 
@@ -998,6 +997,7 @@ struct ast_channel* channel_new(struct pvt* pvt, int ast_state, const char* cid_
         struct ast_format_cap* const cap = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
         ast_format_cap_append_by_type(cap, AST_MEDIA_TYPE_TEXT);
         ast_channel_nativeformats_set(channel, cap);
+        ao2_ref(cap, -1);
     } else {
         struct ast_format* const fmt = (struct ast_format*)pvt_get_audio_format(pvt);
 #if PTIME_USE_DEFAULT
@@ -1009,17 +1009,18 @@ struct ast_channel* channel_new(struct pvt* pvt, int ast_state, const char* cid_
         ast_format_cap_append(cap, fmt, ms);
         ast_format_cap_set_framing(cap, ms);
         ast_channel_nativeformats_set(channel, cap);
+        ao2_ref(cap, -1);
 
         ast_channel_set_rawreadformat(channel, fmt);
         ast_channel_set_rawwriteformat(channel, fmt);
         ast_channel_set_writeformat(channel, fmt);
         ast_channel_set_readformat(channel, fmt);
-    }
 
-    ast_channel_set_fd(channel, 0, pvt->audio_fd);
-    if (pvt->a_timer) {
-        ast_channel_set_fd(channel, 1, ast_timer_fd(pvt->a_timer));
-        ast_timer_set_rate(pvt->a_timer, 50);
+        ast_channel_set_fd(channel, 0, pvt->audio_fd);
+        if (pvt->a_timer) {
+            ast_channel_set_fd(channel, 1, ast_timer_fd(pvt->a_timer));
+            ast_timer_set_rate(pvt->a_timer, 50);
+        }
     }
 
     set_channel_vars(pvt, channel);
@@ -1032,13 +1033,8 @@ struct ast_channel* channel_new(struct pvt* pvt, int ast_state, const char* cid_
         cpvt_change_state(cpvt, (call_state_t)state, AST_CAUSE_NORMAL_UNSPECIFIED);
     }
 
-    ast_module_ref(self_module());
-
-    /* commit e2630fcd516b8f794bf342d9fd267b0c905e79ce
-     * Date:   Wed Dec 18 19:28:05 2013 +0000a
-     * ast_channel_alloc() returns allocated channels locked. */
+    ast_channel_stage_snapshot_done(channel);
     ast_channel_unlock(channel);
-
     return channel;
 }
 
@@ -1117,7 +1113,7 @@ void channel_start_local(struct pvt* pvt, const char* exten, const char* number,
     struct ast_channel* const channel =
         ast_request("Local", pvt->local_format_cap ? pvt->local_format_cap : channel_tech.capabilities, NULL, NULL, ast_str_buffer(channel_name), &cause);
     if (!channel) {
-        ast_log(LOG_ERROR, "[%s] Unable to request channel Local/%s\n", PVT_ID(pvt), ast_str_buffer(channel_name));
+        ast_log(LOG_ERROR, "[%s] Unable to request channel Local/%s: %s [%d]\n", PVT_ID(pvt), ast_str_buffer(channel_name), ast_cause2str(cause), cause);
         return;
     }
 
@@ -1128,8 +1124,7 @@ void channel_start_local(struct pvt* pvt, const char* exten, const char* number,
         setvar_helper(pvt, channel, vars[i].name, vars[i].value);
     }
 
-    cause = ast_pbx_start(channel);
-    if (cause) {
+    if (ast_pbx_start(channel)) {
         ast_hangup(channel);
         ast_log(LOG_ERROR, "[%s] Unable to start pbx on channel Local/%s\n", PVT_ID(pvt), ast_str_buffer(channel_name));
     }

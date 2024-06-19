@@ -47,7 +47,8 @@ typedef enum {
     CALL_FLAG_MULTIPARTY       = 256,  /*!< internal, CLCC mpty is 1 */
     CALL_FLAG_DIRECTION        = 512,  /*!< call direction */
     CALL_FLAG_LOCAL_CHANNEL    = 1024, /*!< local channel flag */
-    CALL_FLAG_INTERNAL_REQUEST = 2048  /*!< internal request */
+    CALL_FLAG_INTERNAL_REQUEST = 2048, /*!< internal request */
+    CALL_FLAG_DISCONNECTING    = 4096  /*!< object is disconnecting */
 } call_flag_t;
 
 #define CALL_DIR_INCOMING 1u
@@ -99,18 +100,15 @@ typedef struct cpvt {
 struct cpvt* cpvt_alloc(struct pvt* pvt, int call_idx, unsigned dir, call_state_t statem, unsigned local_channel);
 void cpvt_free(struct cpvt* cpvt);
 
-void cpvt_lock(struct cpvt* const);
-void cpvt_try_lock(struct cpvt* const);
-void cpvt_unlock(struct cpvt* const);
+int cpvt_lock(struct cpvt* const);
+int cpvt_unlock(struct cpvt* const);
+#define SCOPED_CPVT(varname, lock) SCOPED_LOCK(varname, lock, cpvt_lock, cpvt_unlock)
 
 void cpvt_call_activate(struct cpvt* const cpvt);
 void cpvt_call_disactivate(struct cpvt* const cpvt);
 
 int cpvt_control(const struct cpvt* const cpvt, enum ast_control_frame_type control);
 int cpvt_change_state(struct cpvt* const cpvt, call_state_t newstate, int cause);
-
-#define SCOPED_CPVT(varname, lock) SCOPED_LOCK(varname, lock, cpvt_lock, cpvt_unlock)
-#define SCOPED_CPVT_TL(varname, lock) SCOPED_LOCK(varname, lock, cpvt_try_lock, cpvt_unlock)
 
 void* cpvt_get_buffer(struct cpvt* const cpvt);
 struct ast_frame* cpvt_prepare_voice_frame(struct cpvt* const cpvt, void* const buf, int samples, const struct ast_format* const fmt);

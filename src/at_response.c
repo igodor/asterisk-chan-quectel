@@ -3053,7 +3053,7 @@ static void response_taskproc(struct pvt_taskproc_data* ptd)
 
     if (at_queue_run(rtd->ptd.pvt)) {
         ast_log(LOG_ERROR, "[%s] Fail to run command from queue\n", PVT_ID(rtd->ptd.pvt));
-        rtd->ptd.pvt->terminate_monitor = 1;
+        eventfd_signal(rtd->ptd.pvt->monitor_thread_event);
     }
 }
 

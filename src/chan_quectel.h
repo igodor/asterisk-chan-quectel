@@ -16,8 +16,8 @@
 
 #include "ast_config.h"
 
+#include <asterisk/astobj2.h>
 #include <asterisk/json.h>
-#include <asterisk/linkedlists.h>
 #include <asterisk/localtime.h>
 #include <asterisk/lock.h>
 #include <asterisk/strings.h>
@@ -91,9 +91,6 @@ typedef struct pvt_stat {
 struct at_queue_task;
 
 typedef struct pvt {
-    AST_LIST_ENTRY(pvt) entry; /*!< linked list pointers */
-
-    ast_mutex_t lock;                               /*!< pvt lock */
     AST_LIST_HEAD_NOLOCK(, at_queue_task) at_queue; /*!< queue for commands to modem */
 
     AST_LIST_HEAD_NOLOCK(, cpvt) chans; /*!< list of channels */
@@ -101,6 +98,7 @@ typedef struct pvt {
 
     unsigned long channel_instance; /*!< number of channels created on this device */
     pthread_t monitor_thread;       /*!< monitor (at commands reader) thread handle */
+    int monitor_thread_event;
 
     int audio_fd; /*!< audio descriptor */
     snd_pcm_t* icard;
@@ -169,7 +167,6 @@ typedef struct pvt {
     unsigned int prov_last_used :1; /*!< mark the last used device */
     unsigned int sim_last_used  :1; /*!< mark the last used device */
 
-    unsigned int terminate_monitor    :1; /*!< non-zero if we want terminate monitor thread i.e. restart, stop, remove */
     unsigned int has_subscriber_number:1; /*!< subscriber_number field is valid */
     unsigned int must_remove          :1; /*!< mean must removed from list: NOT FULLY THREADSAFE */
 
@@ -195,7 +192,7 @@ typedef struct pvt {
 #define PVT_STAT(pvt, name) PVT_STAT_T(&(pvt)->stat, name)
 
 typedef struct public_state {
-    AST_RWLIST_HEAD(devices, pvt) devices;
+    struct ao2_container* pvts;
     struct ast_threadpool* threadpool;
     pthread_t dev_manager_thread;
     int dev_manager_event;
@@ -254,7 +251,8 @@ struct cpvt* pvt_channel_find_by_call_idx(struct pvt* pvt, int call_idx);
 struct cpvt* pvt_channel_find_active(struct pvt* pvt);
 struct cpvt* pvt_channel_find_last_initialized(struct pvt* pvt);
 
-void pvt_unlock(struct pvt* const pvt);
+int pvt_lock(struct pvt* const pvt);
+int pvt_unlock(struct pvt* const pvt);
 
 int pvt_taskproc_trylock_and_execute(struct pvt* pvt, void (*task_exe)(struct pvt* pvt), const char* task_name);
 #define PVT_TASKPROC_TRYLOCK_AND_EXECUTE(p, t) pvt_taskproc_trylock_and_execute(p, t, #t)

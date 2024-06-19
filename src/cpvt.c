@@ -14,6 +14,7 @@
 #include "at_queue.h"     /* struct at_queue_task */
 #include "chan_quectel.h" /* struct pvt */
 #include "channel.h"
+#include "helpers.h"
 #include "mutils.h" /* ARRAY_LEN() */
 
 const char* call_state2str(call_state_t state)
@@ -70,14 +71,14 @@ struct cpvt* cpvt_alloc(struct pvt* pvt, int call_idx, unsigned dir, call_state_
     }
 
     const struct ast_format* const fmt = pvt_get_audio_format(pvt);
-    const size_t buffer_size           = pvt_get_audio_frame_size(PTIME_PLAYBACK, fmt);
+    const size_t buffer_size           = pvt_get_audio_frame_size(PTIME_CAPTURE, fmt);
 
     cpvt->pvt        = pvt;
     cpvt->call_idx   = call_idx;
     cpvt->state      = state;
     cpvt->rd_pipe[0] = fd[0];
     cpvt->rd_pipe[1] = fd[1];
-    cpvt->buffer     = ast_calloc(1, buffer_size + AST_FRIENDLY_OFFSET);
+    cpvt->buffer     = ast_calloc(1, buffer_size);
 
     CPVT_SET_DIRECTION(cpvt, dir);
     CPVT_SET_LOCAL(cpvt, local_channel);
@@ -126,12 +127,15 @@ void cpvt_free(struct cpvt* cpvt)
     ast_debug(3, "[%s] Destroy cpvt - idx:%d dir:%d state:%s flags:%d channel:%s\n", PVT_ID(pvt), cpvt->call_idx, CPVT_DIRECTION(cpvt),
               call_state2str(cpvt->state), cpvt->flags, cpvt->channel ? "attached" : "detached");
 
-    if (PVT_NO_CHANS(pvt)) {
-        pvt_on_remove_last_channel(pvt);
-        pvt_try_restate(pvt);
+    if (!CPVT_TEST_FLAG(cpvt, CALL_FLAG_DISCONNECTING)) {
+        if (PVT_NO_CHANS(pvt)) {
+            pvt_on_remove_last_channel(pvt);
+            pvt_try_restate(pvt);
+        }
+
+        decrease_chan_counters(cpvt, pvt);
     }
 
-    decrease_chan_counters(cpvt, pvt);
     relink_to_sys_chan(cpvt, pvt);
 
     ast_free(cpvt->buffer);
@@ -370,44 +374,29 @@ int cpvt_change_state(struct cpvt* const cpvt, call_state_t newstate, int cause)
     return 1;
 }
 
-void cpvt_lock(struct cpvt* const cpvt)
-{
-    struct pvt* const pvt = cpvt->pvt;
-    if (!pvt) {
-        return;
-    }
-
-    ast_mutex_trylock(&pvt->lock);
-}
-
-void cpvt_try_lock(struct cpvt* const cpvt)
-{
-    struct pvt* const pvt = cpvt->pvt;
-    if (!pvt) {
-        return;
-    }
-
-    struct ast_channel* const channel = cpvt->channel;
-    if (!channel) {
-        return;
-    }
-
-    ast_mutex_t* const mutex = &pvt->lock;
-
-    while (ast_mutex_trylock(mutex)) {
-        CHANNEL_DEADLOCK_AVOIDANCE(channel);
-    }
-}
-
-void cpvt_unlock(struct cpvt* const cpvt)
+int cpvt_lock(struct cpvt* const cpvt)
 {
     if (!cpvt) {
-        return;
+        return -1;
     }
-    pvt_unlock(cpvt->pvt);
+
+    struct pvt* const pvt = cpvt->pvt;
+    if (!pvt) {
+        return -1;
+    }
+
+    return pvt_lock(pvt);
 }
 
-void* cpvt_get_buffer(struct cpvt* const cpvt) { return cpvt->buffer + AST_FRIENDLY_OFFSET; }
+int cpvt_unlock(struct cpvt* const cpvt)
+{
+    if (!cpvt) {
+        return -1;
+    }
+    return pvt_unlock(cpvt->pvt);
+}
+
+void* cpvt_get_buffer(struct cpvt* const cpvt) { return cpvt->buffer; }
 
 struct ast_frame* cpvt_prepare_voice_frame(struct cpvt* const cpvt, void* const buf, int samples, const struct ast_format* const fmt)
 {
@@ -420,7 +409,6 @@ struct ast_frame* cpvt_prepare_voice_frame(struct cpvt* const cpvt, void* const 
     f->samples         = samples;
     f->datalen         = samples * sizeof(int16_t);
     f->data.ptr        = buf;
-    f->offset          = AST_FRIENDLY_OFFSET;
     f->src             = AST_MODULE;
 
     ast_frame_byteswap_le(f);

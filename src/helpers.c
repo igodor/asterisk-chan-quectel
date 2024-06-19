@@ -48,6 +48,26 @@ int is_valid_phone_number(const char* number)
     return 1;
 }
 
+int __ao2_unlock_and_unref(void* obj, const char* file, const char* func, int line, const char* var)
+{
+    if (__ao2_unlock(obj, file, func, line, var)) {
+        return 0;
+    }
+    __ao2_ref(obj, -1, NULL, file, line, func);
+
+    return 1;
+}
+
+int __ao2_ref_and_lock(void* obj, const char* file, const char* func, int line, const char* var)
+{
+    __ao2_ref(obj, +1, NULL, file, line, func);
+    if (__ao2_lock(obj, AO2_LOCK_REQ_MUTEX, file, func, line, var)) {
+        __ao2_ref(obj, -1, NULL, file, line, func);
+        return 0;
+    }
+    return 1;
+}
+
 static struct pvt* get_pvt(const char* dev_name, int online)
 {
     struct pvt* const pvt = pvt_find_by_ext(dev_name);
@@ -58,7 +78,8 @@ static struct pvt* get_pvt(const char* dev_name, int online)
     }
 
     if (!pvt->connected || (online && !(pvt->initialized && pvt->gsm_registered))) {
-        ast_mutex_unlock(&pvt->lock);
+        ao2_unlock(pvt);
+        ao2_ref(pvt, -1);
         chan_quectel_err = E_DEVICE_DISABLED;
         return NULL;
     }

@@ -51,21 +51,26 @@
 
 static char* complete_device(const char* word, int state)
 {
+    char* res            = NULL;
+    int which            = 0;
+    const size_t wordlen = strlen(word);
     struct pvt* pvt;
-    char* res   = NULL;
-    int which   = 0;
-    int wordlen = strlen(word);
 
-    AST_RWLIST_RDLOCK(&gpublic->devices);
-    AST_RWLIST_TRAVERSE(&gpublic->devices, pvt, entry) {
-        SCOPED_MUTEX(pvt_lock, &pvt->lock);
+    struct ao2_iterator i = ao2_iterator_init(gpublic->pvts, 0);
+    while ((pvt = ao2_iterator_next(&i))) {
+        if (ao2_lock(pvt)) {
+            ao2_ref(pvt, -1);
+            continue;
+        }
         if (!strncasecmp(PVT_ID(pvt), word, wordlen) && ++which > state) {
             res = ast_strdup(PVT_ID(pvt));
+            AO2_UNLOCK_AND_UNREF(pvt);
             break;
         }
-    }
-    AST_RWLIST_UNLOCK(&gpublic->devices);
 
+        AO2_UNLOCK_AND_UNREF(pvt);
+    }
+    ao2_iterator_destroy(&i);
     return res;
 }
 
@@ -87,14 +92,13 @@ static char* cli_show_devices(struct ast_cli_entry* e, int cmd, struct ast_cli_a
 
     ast_cli(a->fd, FORMAT1, "ID", "Group", "State", "RSSI", "Mode", "Provider Name", "Model", "Firmware", "Number");
 
-    AST_RWLIST_RDLOCK(&gpublic->devices);
-    AST_RWLIST_TRAVERSE(&gpublic->devices, pvt, entry) {
-        SCOPED_MUTEX(pvt_lock, &pvt->lock);
+    struct ao2_iterator i = ao2_iterator_init(gpublic->pvts, 0);
+    while ((pvt = ao2_iterator_next(&i))) {
+        SCOPED_AO2LOCK(pvtl, pvt);
         ast_cli(a->fd, FORMAT2, PVT_ID(pvt), CONF_SHARED(pvt, group), pvt_str_state(pvt), pvt->rssi, pvt->act, pvt->provider_name, pvt->model, pvt->firmware,
                 pvt->imei, pvt->imsi, pvt->subscriber_number);
     }
-    AST_RWLIST_UNLOCK(&gpublic->devices);
-
+    ao2_iterator_destroy(&i);
     return CLI_SUCCESS;
 }
 

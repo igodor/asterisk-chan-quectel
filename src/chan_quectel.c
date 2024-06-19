@@ -67,6 +67,8 @@
 #include "smsdb.h"
 #include "tty.h"
 
+static const int NUM_PVT_BUCKETS = 7;
+
 static int soundcard_init(struct pvt* pvt)
 {
     const struct ast_format* const fmt = pvt_get_audio_format(pvt);
@@ -106,9 +108,17 @@ void pvt_disconnect(struct pvt* pvt)
     if (!PVT_NO_CHANS(pvt)) {
         struct cpvt* cpvt;
         AST_LIST_TRAVERSE(&(pvt->chans), cpvt, entry) {
+            PVT_STATE(pvt, chan_count[cpvt->state])--;
+            PVT_STATE(pvt, chansno)--;
+
             at_hangup_immediately(cpvt, AST_CAUSE_NORMAL_UNSPECIFIED);
+            CPVT_SET_FLAG(cpvt, CALL_FLAG_DISCONNECTING);
             CPVT_RESET_FLAG(cpvt, CALL_FLAG_NEED_HANGUP);
             cpvt_change_state(cpvt, CALL_STATE_RELEASED, AST_CAUSE_NORMAL_UNSPECIFIED);
+        }
+
+        while (!AST_LIST_EMPTY(&(pvt->chans))) {
+            AST_LIST_REMOVE_HEAD(&(pvt->chans), entry);
         }
     }
 
@@ -200,7 +210,7 @@ void pvt_disconnect(struct pvt* pvt)
     memset(&pvt->stat, 0, sizeof(pvt->stat));
 
     if (pvt->local_format_cap) {
-        ao2_cleanup(pvt->local_format_cap);
+        ao2_ref(pvt->local_format_cap, -1);
         pvt->local_format_cap = NULL;
     }
 
@@ -284,27 +294,106 @@ cleanup_datafd:
     tty_close(CONF_UNIQ(pvt, data_tty), pvt->data_fd);
 }
 
-#/* */
-
-static void pvt_free(struct pvt* const pvt)
+static void pvt_finish(struct pvt* const pvt)
 {
+    pvt_monitor_stop(pvt);
     at_queue_flush(pvt);
-    ast_string_field_free_memory(pvt);
-    ast_mutex_unlock(&pvt->lock);
-    ast_mutex_destroy(&pvt->lock);
-    ast_free(pvt);
 }
 
-#/* */
-
-static void pvt_destroy(struct pvt* const pvt)
+static int pvt_finish_cb(void* obj, attribute_unused void* arg, attribute_unused int flags)
 {
-    ast_mutex_lock(&pvt->lock);
+    SCOPED_AO2LOCK(pvtl, obj);
+    struct pvt* const pvt = obj;
     pvt_monitor_stop(pvt);
-    pvt_free(pvt);
+    at_queue_flush(pvt);
+    return 0;
+}
+
+static void pvt_destroy(void* obj)
+{
+    SCOPED_AO2LOCK(pvtl, obj);
+    struct pvt* const pvt = (struct pvt* const)obj;
+    ast_string_field_free_memory(pvt);
 }
 
 // device manager
+
+static void dev_manager_process_pvt(struct pvt* const pvt)
+{
+    if (pvt->must_remove) {
+        return;
+    }
+
+    if (pvt->restart_time != RESTATE_TIME_NOW) {
+        return;
+    }
+    if (pvt->desired_state == pvt->current_state) {
+        return;
+    }
+
+    switch (pvt->desired_state) {
+        case DEV_STATE_RESTARTED:
+            ast_debug(4, "[dev-manager][%s] Restarting device\n", PVT_ID(pvt));
+            pvt_monitor_stop(pvt);
+            pvt->desired_state = DEV_STATE_STARTED;
+            /* fall through */
+
+        case DEV_STATE_STARTED:
+            ast_debug(4, "[dev-manager][%s] Starting device\n", PVT_ID(pvt));
+            pvt_start(pvt);
+            break;
+
+        case DEV_STATE_REMOVED:
+            ast_debug(4, "[dev-manager][%s] Removing device\n", PVT_ID(pvt));
+            pvt_monitor_stop(pvt);
+            pvt->must_remove = 1;
+            break;
+
+        case DEV_STATE_STOPPED:
+            ast_debug(4, "[dev-manager][%s] Stopping device\n", PVT_ID(pvt));
+            pvt_monitor_stop(pvt);
+            break;
+    }
+}
+
+static void dev_manager_process_pvts(struct public_state* const state)
+{
+    struct pvt* pvt;
+    struct ao2_iterator i = ao2_iterator_init(state->pvts, 0);
+    while ((pvt = ao2_iterator_next(&i))) {
+        if (ao2_lock(pvt)) {
+            ao2_ref(pvt, -1);
+            continue;
+        }
+        dev_manager_process_pvt(pvt);
+        AO2_UNLOCK_AND_UNREF(pvt);
+    }
+    ao2_iterator_destroy(&i);
+}
+
+static void dev_manager_remove_pvts(struct public_state* const state)
+{
+    struct pvt* pvt;
+    struct ao2_iterator i = ao2_iterator_init(state->pvts, 0);
+    while ((pvt = ao2_iterator_next(&i))) {
+        if (ao2_trylock(pvt)) {
+            ao2_ref(pvt, -1);
+            continue;
+        }
+
+        if (pvt->must_remove) {
+            ast_debug(4, "[dev-manager][%s] Freeing device\n", PVT_ID(pvt));
+            pvt_finish(pvt);
+            ao2_unlock(pvt);
+            ao2_unlink(state->pvts, pvt);
+        } else {
+            ao2_unlock(pvt);
+        }
+
+        ao2_ref(pvt, -1);
+    }
+    ao2_iterator_destroy(&i);
+}
 
 static const eventfd_t DEV_MANAGER_CMD_SCAN = 1;
 static const eventfd_t DEV_MANAGER_CMD_STOP = 2;
@@ -341,71 +430,13 @@ static void dev_manager_threadproc_state(struct public_state* const state)
         }
 
         // timeout
-        struct pvt* pvt;
-        /* read lock for avoid deadlock when IMEI/IMSI discovery */
-        AST_RWLIST_RDLOCK(&state->devices);
-        AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-            SCOPED_MUTEX(pvt_lock, &pvt->lock);
+        dev_manager_process_pvts(state);
 
-            if (pvt->must_remove) {
-                continue;
-            }
-
-            if (pvt->restart_time != RESTATE_TIME_NOW) {
-                continue;
-            }
-            if (pvt->desired_state == pvt->current_state) {
-                continue;
-            }
-
-            switch (pvt->desired_state) {
-                case DEV_STATE_RESTARTED:
-                    ast_debug(4, "[dev-manager][%s] Restarting device\n", PVT_ID(pvt));
-                    pvt_monitor_stop(pvt);
-                    pvt->desired_state = DEV_STATE_STARTED;
-                    /* fall through */
-
-                case DEV_STATE_STARTED:
-                    ast_debug(4, "[dev-manager][%s] Starting device\n", PVT_ID(pvt));
-                    pvt_start(pvt);
-                    break;
-
-                case DEV_STATE_REMOVED:
-                    ast_debug(4, "[dev-manager][%s] Removing device\n", PVT_ID(pvt));
-                    pvt_monitor_stop(pvt);
-                    pvt->must_remove = 1;
-                    break;
-
-                case DEV_STATE_STOPPED:
-                    ast_debug(4, "[dev-manager][%s] Stopping device\n", PVT_ID(pvt));
-                    pvt_monitor_stop(pvt);
-                    break;
-            }
-        }
-        AST_RWLIST_UNLOCK(&state->devices);
-
-        /* actual device removal here for avoid long (discovery) time write lock on device list in loop above */
-
-        if (AST_RWLIST_TRYWRLOCK(&state->devices)) {
+        if (ao2_trylock(state->pvts)) {
             continue;
         }
-
-        AST_RWLIST_TRAVERSE_SAFE_BEGIN(&state->devices, pvt, entry)
-            {
-                if (ast_mutex_trylock(&pvt->lock)) {
-                    continue;
-                }
-
-                if (pvt->must_remove) {
-                    ast_debug(4, "[dev-manager][%s] Freeing device\n", PVT_ID(pvt));
-                    AST_RWLIST_REMOVE_CURRENT(entry);
-                    pvt_free(pvt);
-                } else {
-                    ast_mutex_unlock(&pvt->lock);
-                }
-            }
-        AST_RWLIST_TRAVERSE_SAFE_END;
-        AST_RWLIST_UNLOCK(&state->devices);
+        dev_manager_remove_pvts(state);
+        ao2_unlock(state->pvts);
     }
 }
 
@@ -452,7 +483,7 @@ void pvt_on_create_1st_channel(struct pvt* pvt)
 {
     const struct ast_format* const fmt = pvt_get_audio_format(pvt);
     const size_t silence_buf_size      = 2u * pvt_get_audio_frame_size(PTIME_PLAYBACK, fmt);
-    pvt->silence_buf                   = ast_calloc(1, silence_buf_size + AST_FRIENDLY_OFFSET);
+    pvt->silence_buf                   = ast_calloc(1, silence_buf_size);
 
     if (CONF_SHARED(pvt, multiparty)) {
         if (CONF_UNIQ(pvt, uac) > TRIBOOL_FALSE) {
@@ -604,13 +635,21 @@ static int can_send_message(struct pvt* pvt, attribute_unused unsigned int opts)
     return 1;
 }
 
-void pvt_unlock(struct pvt* const pvt)
+int pvt_lock(struct pvt* const pvt)
 {
     if (!pvt) {
-        return;
+        return -1;
+    }
+    return AO2_REF_AND_LOCK(pvt);
+}
+
+int pvt_unlock(struct pvt* const pvt)
+{
+    if (!pvt) {
+        return -1;
     }
 
-    ast_mutex_unlock(&pvt->lock);
+    return AO2_UNLOCK_AND_UNREF(pvt);
 }
 
 int pvt_taskproc_trylock_and_execute(struct pvt* pvt, void (*task_exe)(struct pvt* pvt), const char* task_name)
@@ -619,21 +658,18 @@ int pvt_taskproc_trylock_and_execute(struct pvt* pvt, void (*task_exe)(struct pv
         return 0;
     }
 
-    if (ast_mutex_trylock(&pvt->lock)) {
+    ao2_ref(pvt, 1);
+    if (ao2_trylock(pvt)) {
+        ao2_ref(pvt, -1);
         ast_debug(4, "[%s] Task skipping: no lock\n", S_OR(task_name, "UNKNOWN"));
-        return 0;
-    }
-
-    if (pvt->terminate_monitor) {
-        ast_debug(5, "[%s][%s] Task skipping: monitor thread terminated\n", PVT_ID(pvt), S_OR(task_name, "UNKNOWN"));
-        ast_mutex_unlock(&pvt->lock);
         return 0;
     }
 
     ast_debug(5, "[%s][%s] Task executing\n", PVT_ID(pvt), S_OR(task_name, "UNKNOWN"));
     task_exe(pvt);
     ast_debug(6, "[%s][%s] Task executed\n", PVT_ID(pvt), S_OR(task_name, "UNKNOWN"));
-    ast_mutex_unlock(&pvt->lock);
+    ao2_unlock(pvt);
+    ao2_ref(pvt, -1);
     return 0;
 }
 
@@ -643,16 +679,11 @@ int pvt_taskproc_lock_and_execute(struct pvt_taskproc_data* ptd, void (*task_exe
         return 0;
     }
 
-    SCOPED_MUTEX(plock, &ptd->pvt->lock);
-
-    if (ptd->pvt->terminate_monitor) {
-        ast_debug(5, "[%s][%s] Task skipping: monitor thread terminated\n", PVT_ID(ptd->pvt), S_OR(task_name, "UNKNOWN"));
-        return 0;
-    }
-
+    AO2_REF_AND_LOCK(ptd->pvt);
     ast_debug(5, "[%s][%s] Task executing\n", PVT_ID(ptd->pvt), S_OR(task_name, "UNKNOWN"));
     task_exe(ptd);
     ast_debug(6, "[%s][%s] Task executed\n", PVT_ID(ptd->pvt), S_OR(task_name, "UNKNOWN"));
+    AO2_UNLOCK_AND_UNREF(ptd->pvt);
     return 0;
 }
 
@@ -661,18 +692,21 @@ int pvt_taskproc_lock_and_execute(struct pvt_taskproc_data* ptd, void (*task_exe
 struct pvt* pvt_find_ex(struct public_state* state, const char* name)
 {
     struct pvt* pvt;
-
-    AST_RWLIST_RDLOCK(&state->devices);
-    AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-        ast_mutex_lock(&pvt->lock);
-        if (!strcmp(PVT_ID(pvt), name)) {
-            break;
+    struct ao2_iterator i = ao2_iterator_init(state->pvts, 0);
+    while ((pvt = ao2_iterator_next(&i))) {
+        if (ao2_lock(pvt)) {
+            ao2_ref(pvt, -1);
+            continue;
         }
-        ast_mutex_unlock(&pvt->lock);
-    }
-    AST_RWLIST_UNLOCK(&state->devices);
 
-    return pvt;
+        if (!strcmp(PVT_ID(pvt), name)) {
+            ao2_iterator_destroy(&i);
+            return pvt;
+        }
+        AO2_UNLOCK_AND_UNREF(pvt);
+    }
+    ao2_iterator_destroy(&i);
+    return NULL;
 }
 
 #/* return locked pvt or NULL */
@@ -683,7 +717,7 @@ struct pvt* pvt_find_by_ext(const char* name)
 
     if (pvt) {
         if (!pvt_enabled(pvt)) {
-            ast_mutex_unlock(&pvt->lock);
+            AO2_UNLOCK_AND_UNREF(pvt);
             chan_quectel_err = E_DEVICE_DISABLED;
             pvt              = NULL;
         }
@@ -693,214 +727,286 @@ struct pvt* pvt_find_by_ext(const char* name)
     return pvt;
 }
 
+struct pvt_test_fn {
+    int opts;
+    const struct ast_channel* requestor;
+    int (*test_fn)(struct pvt*, unsigned int);
+};
+
+static int call_pvt_test_fn(const struct pvt_test_fn* const fn, struct pvt* pvt)
+{
+    if (fn->opts & CALL_FLAG_INTERNAL_REQUEST) {
+        return 1;
+    }
+
+    if ((fn->opts & CALL_FLAG_HOLD_OTHER) == CALL_FLAG_HOLD_OTHER && channel_self_request(pvt, fn->requestor)) {
+        return 0;
+    }
+
+    if (!fn->test_fn) {
+        return 1;
+    }
+
+    return (*fn->test_fn)(pvt, fn->opts);
+}
+
+void* get_rr_next(struct ao2_iterator* i, const struct pvt_test_fn* const fn, void* last_used)
+{
+    void* obj = NULL;
+    if (last_used) {
+        int last_used_found = 0;
+        while ((obj = ao2_iterator_next(i))) {
+            if (last_used_found) {
+                SCOPED_AO2LOCK(pvtl, obj);
+                if (call_pvt_test_fn(fn, obj)) {
+                    break;
+                }
+            }
+
+            if (obj == last_used) {
+                last_used_found = 1;
+            }
+            ao2_ref(obj, -1);
+        }
+
+        if (obj) {
+            return obj;
+        }
+        ao2_iterator_restart(i);
+    }
+
+    while ((obj = ao2_iterator_next(i))) {
+        if (obj == last_used) {
+            ao2_ref(obj, -1);
+            return NULL;
+        }
+
+        {
+            SCOPED_AO2LOCK(pvtl, obj);
+            if (call_pvt_test_fn(fn, obj)) {
+                break;
+            }
+        }
+        ao2_ref(obj, -1);
+    }
+    return obj;
+}
+
+struct pvt_find_by_group {
+    int group;
+};
+
+static int pvt_find_by_goup_cb(void* obj, void* arg, attribute_unused int flags)
+{
+    SCOPED_AO2LOCK(obj_lock, obj);
+    const struct pvt_find_by_group* const f = arg;
+    const struct pvt* const pvt             = obj;
+
+    if (CONF_SHARED(pvt, group) != f->group) {
+        return 0;
+    }
+
+    return CMP_MATCH | CMP_STOP;
+}
+
+struct pvt_find_by_group_rr {
+    int group;
+    void* last_used;
+};
+
+static int pvt_find_by_goup_rr_cb(void* obj, void* arg, attribute_unused int flags)
+{
+    SCOPED_AO2LOCK(obj_lock, obj);
+    struct pvt_find_by_group_rr* f = arg;
+    struct pvt* pvt                = obj;
+
+    if (CONF_SHARED(pvt, group) != f->group) {
+        return 0;
+    }
+
+    if (pvt->group_last_used) {
+        pvt->group_last_used = 0;
+        f->last_used         = pvt;
+    }
+
+    return CMP_MATCH;
+}
+
+struct pvt_find_by_provider_name_rr {
+    const char* provider_name;
+    void* last_used;
+};
+
+static int pvt_find_by_provider_name_rr_cb(void* obj, void* arg, attribute_unused int flags)
+{
+    SCOPED_AO2LOCK(obj_lock, obj);
+    struct pvt_find_by_provider_name_rr* f = arg;
+    struct pvt* pvt                        = obj;
+
+    if (strcmp(pvt->provider_name, f->provider_name)) {
+        return 0;
+    }
+
+    if (pvt->prov_last_used) {
+        pvt->prov_last_used = 0;
+        f->last_used        = pvt;
+    }
+
+    return CMP_MATCH;
+}
+
+struct pvt_find_by_imsi_rr {
+    const char* imsi;
+    void* last_used;
+};
+
+static int pvt_find_by_imsi_rr_cb(void* obj, void* arg, attribute_unused int flags)
+{
+    SCOPED_AO2LOCK(obj_lock, obj);
+    struct pvt_find_by_imsi_rr* f = arg;
+    struct pvt* pvt               = obj;
+
+    if (strcmp(pvt->imsi, f->imsi)) {
+        return 0;
+    }
+
+    if (pvt->sim_last_used) {
+        pvt->sim_last_used = 0;
+        f->last_used       = pvt;
+    }
+
+    return CMP_MATCH;
+}
+
+struct pvt_find_by_imei {
+    const char* imei;
+};
+
+static int pvt_find_by_imei_cb(void* obj, void* arg, attribute_unused int flags)
+{
+    SCOPED_AO2LOCK(obj_lock, obj);
+    const struct pvt_find_by_imei* f = arg;
+    const struct pvt* pvt            = obj;
+
+    if (strcmp(pvt->imei, f->imei)) {
+        return 0;
+    }
+
+    return CMP_MATCH | CMP_STOP;
+}
+
+struct pvt_find_by_iccid {
+    const char* iccid;
+};
+
+static int pvt_find_by_iccid_cb(void* obj, void* arg, attribute_unused int flags)
+{
+    SCOPED_AO2LOCK(obj_lock, obj);
+    const struct pvt_find_by_iccid* f = arg;
+    const struct pvt* pvt             = obj;
+
+    if (strcmp(pvt->iccid, f->iccid)) {
+        return 0;
+    }
+
+    return CMP_MATCH | CMP_STOP;
+}
+
+struct pvt_find_by_id {
+    const char* id;
+};
+
+static int pvt_find_by_id_cb(void* obj, void* arg, attribute_unused int flags)
+{
+    SCOPED_AO2LOCK(obj_lock, obj);
+    const struct pvt_find_by_id* f = arg;
+    const struct pvt* pvt          = obj;
+
+    if (strcmp(PVT_ID(pvt), f->id)) {
+        return 0;
+    }
+
+    return CMP_MATCH | CMP_STOP;
+}
+
 static struct pvt* pvt_find_by_resource_fn(struct public_state* state, const char* resource, unsigned int opts, int (*pvt_test_fn)(struct pvt*, unsigned int),
                                            const struct ast_channel* requestor, int* exists)
 {
-    auto int test_fn(struct pvt * pvt)
-    {
-        if (opts & CALL_FLAG_INTERNAL_REQUEST) {
-            return 1;
-        }
-
-        if ((opts & CALL_FLAG_HOLD_OTHER) == CALL_FLAG_HOLD_OTHER && channel_self_request(pvt, requestor)) {
-            return 0;
-        }
-
-        return (*pvt_test_fn)(pvt, opts);
-    }
-
-    int group;
-    size_t i;
-    size_t j;
-    size_t c;
-    size_t last_used;
-    struct pvt* pvt;
-    struct pvt* found = NULL;
-    struct pvt* round_robin[MAXQUECTELDEVICES];
-
-    *exists = 0;
-    /* Find requested device and make sure it's connected and initialized. */
-    AST_RWLIST_RDLOCK(&state->devices);
+    const struct pvt_test_fn test_fn = {.opts = opts, .requestor = requestor, .test_fn = pvt_test_fn};
+    *exists                          = 0;
+    struct pvt* found                = NULL;
 
     if (((resource[0] == 'g') || (resource[0] == 'G')) && ((resource[1] >= '0') && (resource[1] <= '9'))) {
-        errno = 0;
-        group = (int)strtol(&resource[1], (char**)NULL, 10);
+        errno           = 0;
+        const int group = (int)strtol(&resource[1], (char**)NULL, 10);
         if (errno != EINVAL) {
-            AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-                ast_mutex_lock(&pvt->lock);
-
-                if (CONF_SHARED(pvt, group) == group) {
-                    *exists = 1;
-                    if (test_fn(pvt)) {
-                        found = pvt;
-                        break;
-                    }
-                }
-                ast_mutex_unlock(&pvt->lock);
-            }
+            const struct pvt_find_by_group f = {.group = group};
+            struct ao2_iterator* i           = ao2_callback(state->pvts, OBJ_MULTIPLE, pvt_find_by_goup_cb, (void*)&f);
+            *exists                          = ao2_iterator_count(i);
+            found                            = get_rr_next(i, &test_fn, NULL);
+            ao2_iterator_destroy(i);
         }
     } else if (((resource[0] == 'r') || (resource[0] == 'R')) && ((resource[1] >= '0') && (resource[1] <= '9'))) {
-        errno = 0;
-        group = (int)strtol(&resource[1], (char**)NULL, 10);
+        errno           = 0;
+        const int group = (int)strtol(&resource[1], (char**)NULL, 10);
         if (errno != EINVAL) {
-            /* Generate a list of all available devices */
-            j         = ARRAY_LEN(round_robin);
-            c         = 0;
-            last_used = 0;
-            AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-                SCOPED_MUTEX(pvt_lock, &pvt->lock);
-                if (CONF_SHARED(pvt, group) == group) {
-                    round_robin[c] = pvt;
-                    if (pvt->group_last_used == 1) {
-                        pvt->group_last_used = 0;
-                        last_used            = c;
-                    }
-
-                    ++c;
-
-                    if (c == j) {
-                        break;
-                    }
-                }
+            const struct pvt_find_by_group_rr f = {.group = group, .last_used = NULL};
+            struct ao2_iterator* i              = ao2_callback(state->pvts, OBJ_MULTIPLE, pvt_find_by_goup_rr_cb, (void*)&f);
+            *exists                             = ao2_iterator_count(i);
+            found                               = get_rr_next(i, &test_fn, f.last_used);
+            if (found) {
+                SCOPED_AO2LOCK(found_lock, found);
+                found->group_last_used = 1;
             }
-
-            /* Search for a available device starting at the last used device */
-            for (i = 0, j = last_used + 1; i < c; i++, j++) {
-                if (j == c) {
-                    j = 0;
-                }
-
-                pvt     = round_robin[j];
-                *exists = 1;
-
-                ast_mutex_lock(&pvt->lock);
-                if (test_fn(pvt)) {
-                    pvt->group_last_used = 1;
-                    found                = pvt;
-                    break;
-                }
-                ast_mutex_unlock(&pvt->lock);
-            }
+            ao2_iterator_destroy(i);
         }
     } else if (((resource[0] == 'p') || (resource[0] == 'P')) && resource[1] == ':') {
-        /* Generate a list of all available devices */
-        j         = ARRAY_LEN(round_robin);
-        c         = 0;
-        last_used = 0;
-        AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-            SCOPED_MUTEX(pvt_lock, &pvt->lock);
-            if (!strcmp(pvt->provider_name, &resource[2])) {
-                round_robin[c] = pvt;
-                if (pvt->prov_last_used == 1) {
-                    pvt->prov_last_used = 0;
-                    last_used           = c;
-                }
-
-                ++c;
-
-                if (c == j) {
-                    break;
-                }
-            }
+        const struct pvt_find_by_provider_name_rr f = {.provider_name = &resource[2], .last_used = NULL};
+        struct ao2_iterator* i                      = ao2_callback(state->pvts, OBJ_MULTIPLE, pvt_find_by_provider_name_rr_cb, (void*)&f);
+        *exists                                     = ao2_iterator_count(i);
+        found                                       = get_rr_next(i, &test_fn, f.last_used);
+        if (found) {
+            SCOPED_AO2LOCK(found_lock, found);
+            found->prov_last_used = 1;
         }
-
-        /* Search for a available device starting at the last used device */
-        for (i = 0, j = last_used + 1; i < c; ++i, ++j) {
-            if (j == c) {
-                j = 0;
-            }
-
-            pvt     = round_robin[j];
-            *exists = 1;
-
-            ast_mutex_lock(&pvt->lock);
-            if (test_fn(pvt)) {
-                pvt->prov_last_used = 1;
-                found               = pvt;
-                break;
-            }
-            ast_mutex_unlock(&pvt->lock);
-        }
+        ao2_iterator_destroy(i);
     } else if (((resource[0] == 's') || (resource[0] == 'S')) && resource[1] == ':') {
-        /* Generate a list of all available devices */
-        j         = ARRAY_LEN(round_robin);
-        c         = 0;
-        last_used = 0;
-        i         = strlen(&resource[2]);
-
-        AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-            SCOPED_MUTEX(pvt_lock, &pvt->lock);
-            if (!strncmp(pvt->imsi, &resource[2], i)) {
-                round_robin[c] = pvt;
-                if (pvt->sim_last_used == 1) {
-                    pvt->sim_last_used = 0;
-                    last_used          = c;
-                }
-
-                ++c;
-
-                if (c == j) {
-                    break;
-                }
-            }
+        const struct pvt_find_by_imsi_rr f = {.imsi = &resource[2], .last_used = NULL};
+        struct ao2_iterator* i             = ao2_callback(state->pvts, OBJ_MULTIPLE, pvt_find_by_imsi_rr_cb, (void*)&f);
+        *exists                            = ao2_iterator_count(i);
+        found                              = get_rr_next(i, &test_fn, f.last_used);
+        if (found) {
+            SCOPED_AO2LOCK(found_lock, found);
+            found->sim_last_used = 1;
         }
-
-        /* Search for a available device starting at the last used device */
-        for (i = 0, j = last_used + 1; i < c; ++i, ++j) {
-            if (j == c) {
-                j = 0;
-            }
-
-            pvt     = round_robin[j];
-            *exists = 1;
-
-            ast_mutex_lock(&pvt->lock);
-            if (test_fn(pvt)) {
-                pvt->sim_last_used = 1;
-                found              = pvt;
-                break;
-            }
-            ast_mutex_unlock(&pvt->lock);
-        }
+        ao2_iterator_destroy(i);
     } else if (((resource[0] == 'i') || (resource[0] == 'I')) && resource[1] == ':') {
-        AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-            ast_mutex_lock(&pvt->lock);
-            if (!strcmp(pvt->imei, &resource[2])) {
-                *exists = 1;
-                if (test_fn(pvt)) {
-                    found = pvt;
-                    break;
-                }
-            }
-            ast_mutex_unlock(&pvt->lock);
-        }
+        const struct pvt_find_by_imei f = {.imei = &resource[2]};
+        struct ao2_iterator* i          = ao2_callback(state->pvts, OBJ_MULTIPLE, pvt_find_by_imei_cb, (void*)&f);
+        *exists                         = ao2_iterator_count(i);
+        found                           = get_rr_next(i, &test_fn, NULL);
+        ao2_iterator_destroy(i);
     } else if (((resource[0] == 'j') || (resource[0] == 'J')) && resource[1] == ':') {
-        AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-            ast_mutex_lock(&pvt->lock);
-            if (!strcmp(pvt->iccid, &resource[2])) {
-                *exists = 1;
-                if (test_fn(pvt)) {
-                    found = pvt;
-                    break;
-                }
-            }
-            ast_mutex_unlock(&pvt->lock);
-        }
+        const struct pvt_find_by_iccid f = {.iccid = &resource[2]};
+        struct ao2_iterator* i           = ao2_callback(state->pvts, OBJ_MULTIPLE, pvt_find_by_iccid_cb, (void*)&f);
+        *exists                          = ao2_iterator_count(i);
+        found                            = get_rr_next(i, &test_fn, NULL);
+        ao2_iterator_destroy(i);
     } else {
-        AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-            ast_mutex_lock(&pvt->lock);
-            if (!strcmp(PVT_ID(pvt), resource)) {
-                *exists = 1;
-                if (test_fn(pvt)) {
-                    found = pvt;
-                    break;
-                }
-            }
-            ast_mutex_unlock(&pvt->lock);
+        const struct pvt_find_by_id f = {.id = resource};
+        struct ao2_iterator* i        = ao2_callback(state->pvts, OBJ_MULTIPLE, pvt_find_by_id_cb, (void*)&f);
+        *exists                       = ao2_iterator_count(i);
+        found                         = get_rr_next(i, &test_fn, NULL);
+        ao2_iterator_destroy(i);
+    }
+
+    if (found) {
+        if (ao2_lock(found)) {
+            ao2_ref(found, -1);
+            found = NULL;
         }
     }
 
-    AST_RWLIST_UNLOCK(&state->devices);
     return found;
 }
 
@@ -1112,30 +1218,29 @@ void pvt_get_status(const struct pvt* const pvt, struct ast_json* status)
 
 static struct pvt* pvt_create(const pvt_config_t* settings)
 {
-    struct pvt* const pvt = ast_calloc(1, sizeof(*pvt) + 1u);
+    struct pvt* const pvt = ao2_alloc(sizeof(struct pvt) + 1u, pvt_destroy);
 
     if (!pvt) {
         ast_log(LOG_ERROR, "[%s] Skipping device: Error allocating memory\n", UCONFIG(settings, id));
         return NULL;
     }
 
-    ast_mutex_init(&pvt->lock);
-
     AST_LIST_HEAD_INIT_NOLOCK(&pvt->at_queue);
     AST_LIST_HEAD_INIT_NOLOCK(&pvt->chans);
 
-    pvt->monitor_thread     = AST_PTHREADT_NULL;
-    pvt->sys_chan.pvt       = pvt;
-    pvt->sys_chan.state     = CALL_STATE_RELEASED;
-    pvt->audio_fd           = -1;
-    pvt->data_fd            = -1;
-    pvt->gsm_reg_status     = -1;
-    pvt->has_sms            = SCONFIG(settings, msg_direct) ? 0 : 1;
-    pvt->incoming_sms_index = -1;
-    pvt->incoming_sms_type  = RES_UNKNOWN;
-    pvt->desired_state      = SCONFIG(settings, init_state);
+    pvt->monitor_thread       = AST_PTHREADT_NULL;
+    pvt->monitor_thread_event = -1;
+    pvt->sys_chan.pvt         = pvt;
+    pvt->sys_chan.state       = CALL_STATE_RELEASED;
+    pvt->audio_fd             = -1;
+    pvt->data_fd              = -1;
+    pvt->gsm_reg_status       = -1;
+    pvt->has_sms              = SCONFIG(settings, msg_direct) ? 0 : 1;
+    pvt->incoming_sms_index   = -1;
+    pvt->incoming_sms_type    = RES_UNKNOWN;
+    pvt->desired_state        = SCONFIG(settings, init_state);
 
-    ast_string_field_init(pvt, 15);
+    ast_string_field_init(pvt, 14);
     ast_string_field_set(pvt, provider_name, "NONE");
     ast_string_field_set(pvt, subscriber_number, NULL);
 
@@ -1216,18 +1321,15 @@ int pvt_set_act(struct pvt* pvt, int act)
 
 #/* */
 
-static void mark_must_remove(public_state_t* const state)
+static int pvt_mark_must_remove_cb(void* obj, attribute_unused void* arg, attribute_unused int flags)
 {
-    struct pvt* pvt;
-
-    /* FIXME: deadlock avoid ? */
-    AST_RWLIST_RDLOCK(&state->devices);
-    AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-        SCOPED_MUTEX(pvt_lock, &pvt->lock);
-        pvt->must_remove = 1;
-    }
-    AST_RWLIST_UNLOCK(&state->devices);
+    SCOPED_AO2LOCK(pvtl, obj);
+    struct pvt* pvt  = obj;
+    pvt->must_remove = 1;
+    return 0;
 }
+
+static void mark_must_remove(public_state_t* const state) { ao2_callback(state->pvts, OBJ_NODATA, pvt_mark_must_remove_cb, NULL); }
 
 static void mark_remove(public_state_t* const state, const restate_time_t when, unsigned int* reload_cnt)
 {
@@ -1235,10 +1337,14 @@ static void mark_remove(public_state_t* const state, const restate_time_t when, 
 
     /* FIXME: deadlock avoid ? */
     /* schedule removal of devices not listed in config file or disabled */
-    AST_RWLIST_RDLOCK(&state->devices);
-    AST_RWLIST_TRAVERSE(&state->devices, pvt, entry) {
-        SCOPED_MUTEX(pvt_lock, &pvt->lock);
+    struct ao2_iterator i = ao2_iterator_init(state->pvts, 0);
+    while ((pvt = ao2_iterator_next(&i))) {
+        if (ao2_lock(pvt)) {
+            ao2_ref(pvt, -1);
+            continue;
+        }
         if (!pvt->must_remove) {
+            AO2_UNLOCK_AND_UNREF(pvt);
             continue;
         }
 
@@ -1249,8 +1355,9 @@ static void mark_remove(public_state_t* const state, const restate_time_t when, 
         } else {
             pvt->restart_time = when;
         }
+        AO2_UNLOCK_AND_UNREF(pvt);
     }
-    AST_RWLIST_UNLOCK(&state->devices);
+    ao2_iterator_destroy(&i);
 }
 
 static int reload_config(public_state_t* state, int recofigure, restate_time_t when, unsigned* reload_immediality)
@@ -1305,13 +1412,14 @@ static int reload_config(public_state_t* state, int recofigure, restate_time_t w
             if (!new_pvt) {
                 continue;
             }
-            /* FIXME: deadlock avoid ? */
-            AST_RWLIST_WRLOCK(&state->devices);
-            AST_RWLIST_INSERT_TAIL(&state->devices, new_pvt, entry);
-            AST_RWLIST_UNLOCK(&state->devices);
-            reload_now++;
 
-            ast_log(LOG_NOTICE, "[%s] Loaded device\n", PVT_ID(new_pvt));
+            if (ao2_link(state->pvts, new_pvt)) {
+                reload_now++;
+                ast_log(LOG_NOTICE, "[%s] Device loaded\n", PVT_ID(new_pvt));
+            } else {
+                ast_log(LOG_ERROR, "[%s] Could not add device to container\n", PVT_ID(new_pvt));
+            }
+            ao2_ref(new_pvt, -1);
         }
     }
 
@@ -1328,14 +1436,14 @@ static int reload_config(public_state_t* state, int recofigure, restate_time_t w
 
 static void devices_destroy(public_state_t* state)
 {
-    struct pvt* pvt;
+    ao2_ref(state->pvts, -1);
+    state->pvts = NULL;
+}
 
-    /* Destroy the device list */
-    AST_RWLIST_WRLOCK(&state->devices);
-    while ((pvt = AST_RWLIST_REMOVE_HEAD(&state->devices, entry))) {
-        pvt_destroy(pvt);
-    }
-    AST_RWLIST_UNLOCK(&state->devices);
+static void devices_finish(public_state_t* state)
+{
+    ao2_callback(state->pvts, OBJ_NODATA, pvt_finish_cb, NULL);
+    devices_destroy(state);
 }
 
 const struct ast_format* pvt_get_audio_format(const struct pvt* const pvt)
@@ -1387,7 +1495,7 @@ size_t pvt_get_audio_frame_size(unsigned int ptime, const struct ast_format* con
 
 #endif
 
-void* pvt_get_silence_buffer(struct pvt* const pvt) { return pvt->silence_buf + AST_FRIENDLY_OFFSET; }
+void* pvt_get_silence_buffer(struct pvt* const pvt) { return pvt->silence_buf; }
 
 int pvt_direct_write(struct pvt* pvt, const char* buf, size_t count)
 {
@@ -1448,6 +1556,20 @@ static unsigned int get_default_framing() { return PTIME_CAPTURE }
 
 #endif
 
+static int pvt_hash_cb(const void* obj, const int flags)
+{
+    const struct pvt* const pvt = obj;
+
+    return ast_str_case_hash(PVT_ID(pvt));
+}
+
+static int pvt_cmp_cb(void* obj, void* arg, int flags)
+{
+    const struct pvt *const pvt = obj, *const pvt2 = arg;
+
+    return !strcasecmp(PVT_ID(pvt), PVT_ID(pvt2)) ? CMP_MATCH | CMP_STOP : 0;
+}
+
 static int public_state_init(struct public_state* state)
 {
     int rv = AST_MODULE_LOAD_DECLINE;
@@ -1460,11 +1582,18 @@ static int public_state_init(struct public_state* state)
     state->dev_manager_event  = eventfd_create();
     state->dev_manager_thread = AST_PTHREADT_NULL;
 
-    AST_RWLIST_HEAD_INIT(&state->devices);
+    state->pvts = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, NUM_PVT_BUCKETS, pvt_hash_cb, NULL, pvt_cmp_cb);
+    if (!state->pvts) {
+        ast_threadpool_shutdown(state->threadpool);
+        return rv;
+    }
+
+    ao2_callback(state->pvts, OBJ_NODATA, pvt_mark_must_remove_cb, NULL);
 
     if (reload_config(state, 0, RESTATE_TIME_NOW, NULL)) {
         ast_log(LOG_ERROR, "Errors reading config file " CONFIG_FILE ", Not loading module\n");
-        AST_RWLIST_HEAD_DESTROY(&state->devices);
+        devices_destroy(state);
+        ast_threadpool_shutdown(state->threadpool);
         return rv;
     }
 
@@ -1473,7 +1602,7 @@ static int public_state_init(struct public_state* state)
     if (dev_manager_start(state)) {
         ast_log(LOG_ERROR, "Unable to create device manager thread\n");
         devices_destroy(state);
-        AST_RWLIST_HEAD_DESTROY(&state->devices);
+        ast_threadpool_shutdown(state->threadpool);
         return rv;
     }
 
@@ -1483,7 +1612,7 @@ static int public_state_init(struct public_state* state)
         ast_log(LOG_ERROR, "Unable to create channel capabilities\n");
         dev_manager_stop(state);
         devices_destroy(state);
-        AST_RWLIST_HEAD_DESTROY(&state->devices);
+        ast_threadpool_shutdown(state->threadpool);
         return rv;
     }
 
@@ -1494,11 +1623,11 @@ static int public_state_init(struct public_state* state)
 
     if (ast_channel_register(&channel_tech)) {
         ast_log(LOG_ERROR, "Unable to register channel class %s\n", channel_tech.type);
-        ao2_cleanup(channel_tech.capabilities);
+        ao2_ref(channel_tech.capabilities, -1);
         channel_tech.capabilities = NULL;
         dev_manager_stop(state);
         devices_destroy(state);
-        AST_RWLIST_HEAD_DESTROY(&state->devices);
+        ast_threadpool_shutdown(state->threadpool);
         return rv;
     }
 
@@ -1521,7 +1650,7 @@ static void public_state_fini(struct public_state* const state)
 {
     /* First, take us out of the channel loop */
     ast_channel_unregister(&channel_tech);
-    ao2_cleanup(channel_tech.capabilities);
+    ao2_ref(channel_tech.capabilities, -1);
     channel_tech.capabilities = NULL;
 
     /* Unregister the CLI */
@@ -1538,16 +1667,17 @@ static void public_state_fini(struct public_state* const state)
     smsdb_atexit();
 
     dev_manager_stop(state);
-    devices_destroy(state);
+    devices_finish(state);
 
     eventfd_close(&state->dev_manager_event);
-    AST_RWLIST_HEAD_DESTROY(&state->devices);
-
-    ast_threadpool_shutdown(gpublic->threadpool);
+    ast_threadpool_shutdown(state->threadpool);
 }
 
 static int unload_module()
 {
+    if (!gpublic) {
+        return 0;
+    }
     public_state_fini(gpublic);
     ast_free(gpublic);
     gpublic = NULL;

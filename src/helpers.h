@@ -4,11 +4,18 @@
 #ifndef CHAN_QUECTEL_HELPERS_H_INCLUDED
 #define CHAN_QUECTEL_HELPERS_H_INCLUDED
 
+#include <asterisk/astobj2.h>
 #include <asterisk/localtime.h>
 #include <asterisk/strings.h>
 
 #include "chan_quectel.h" /* restate_time_t */
 #include "dc_config.h"    /* call_waiting_t */
+
+int __ao2_unlock_and_unref(void* obj, const char* file, const char* func, int line, const char* var);
+#define AO2_UNLOCK_AND_UNREF(a) __ao2_unlock_and_unref(a, __FILE__, __PRETTY_FUNCTION__, __LINE__, #a)
+
+int __ao2_ref_and_lock(void* obj, const char* file, const char* func, int line, const char* var);
+#define AO2_REF_AND_LOCK(a) __ao2_ref_and_lock(a, __FILE__, __PRETTY_FUNCTION__, __LINE__, #a)
 
 /* return status string of sending, status arg is optional */
 int send_ussd(const char* dev_name, const char* ussd);
